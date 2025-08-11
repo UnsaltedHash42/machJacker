@@ -1,5 +1,9 @@
 # **MachJacker 🏴‍☠️**
 
+<p align="center">
+  <img src="MachJacker.png" alt="MachJacker logo" width="500" height="auto" />
+</p>
+
 **A modern process injection tool for macOS (ARM64 / Apple Silicon)**
 
 MachJacker is a proof-of-concept utility that leverages the Mach kernel API to inject and execute code within the memory space of other running applications on Apple Silicon Macs. It serves as an educational tool for exploring the low-level mechanics of macOS process manipulation.
